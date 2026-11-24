@@ -54,7 +54,8 @@ Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
 - Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
 - The bindless buffer-view heap keeps per-copy refresh spans in an incremental slot index, rather than rescanning all 81,000 cached views every frame; a full reconciliation still runs every 16 passes.
-- Write-watch ranges are indexed by address in a B-tree, replacing repeated linear scans when checking whether a refresh was already queried.
+- The bindless texture queue selects only the batch it can process (up to 4,096 slots), instead of sorting every due entry, and collects its frame counters during the same queue walk.
+- Write-watch ranges are indexed by address in a B-tree, replacing repeated linear scans when checking whether a refresh was already queried; kernel-reported pages go straight into the journal without an intermediate allocation.
 - Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
