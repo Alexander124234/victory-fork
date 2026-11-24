@@ -397,9 +397,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    // The kernel's answer buffer is reused by the journal. Borrow it and
+    // the page map as disjoint fields so the reported pages can be inserted
+    // directly, without allocating an intermediate Vec on every refresh.
+    {
+        let found = &j.found[..count];
+        let written = &mut j.written;
+        for page in found.iter().map(|&at| at / PAGE).chain(guarded) {
+            written.insert(page, now);
+        }
     }
     Some((
         now,
