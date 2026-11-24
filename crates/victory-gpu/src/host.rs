@@ -4792,31 +4792,39 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        let dred = dred_on();
+        let timed = timing();
+        if !dred && !timed {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
+        let started = std::time::Instant::now();
+        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        // Timestamp profiling is independent of DRED. DRED markers are for
+        // device-removal breadcrumbs; requiring them for timestamps made
+        // VICTORY_GPU_TIMING silently report zero-duration commands unless
+        // the debug-layer breadcrumb path was enabled too.
+        if timed && at < STAMPS - 1
+            && let Some((heap, _)) = self.stamps()
         {
-            let started = std::time::Instant::now();
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
-            }
-            let what = what();
-            crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+        }
+        let what = what();
+        crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
+        if dred {
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
             unsafe {
                 self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
-            self.notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((what, range));
-            crate::copystat::add(crate::copystat::C::NoteNs, started.elapsed().as_nanos() as u64);
         }
+        self.notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((what, range));
+        crate::copystat::add(crate::copystat::C::NoteNs, started.elapsed().as_nanos() as u64);
     }
 
     /// Whether nothing recorded since the list was opened does any work:
