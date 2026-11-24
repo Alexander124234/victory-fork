@@ -106,6 +106,50 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         ask_run(j, &pieces[i..k]);
         i = k;
     }
+    // Successful asks can overlap when a failed wide ask is split around
+    // reservation boundaries. Keep the journal's coverage index ordered
+    // and non-overlapping so range lookups are logarithmic.
+    normalize_ahead(&mut j.ahead);
+}
+
+/// Sorts successful write-watch intervals and joins overlaps (not merely
+/// adjacent intervals, which may belong to different reservations).
+fn normalize_ahead(ahead: &mut Vec<(usize, usize)>) {
+    ahead.sort_unstable();
+    let mut written = 0;
+    for read in 0..ahead.len() {
+        let (from, to) = ahead[read];
+        if written != 0 && from < ahead[written - 1].1 {
+            ahead[written - 1].1 = ahead[written - 1].1.max(to);
+        } else {
+            ahead[written] = (from, to);
+            written += 1;
+        }
+    }
+    ahead.truncate(written);
+}
+
+/// Whether one ordered interval contains the complete page range.
+fn ahead_covers(ahead: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let at = ahead.partition_point(|&(from, _)| from <= first);
+    at != 0 && ahead[at - 1].1 >= last
+}
+
+/// Adds a successful interval while preserving the sorted, non-overlapping
+/// index used by ahead_covers.
+fn record_ahead(ahead: &mut Vec<(usize, usize)>, mut range: (usize, usize)) {
+    let mut at = ahead.partition_point(|&(from, _)| from < range.0);
+    if at != 0 && ahead[at - 1].1 > range.0 {
+        at -= 1;
+        range.0 = ahead[at].0.min(range.0);
+        range.1 = ahead[at].1.max(range.1);
+    }
+    let mut end = at;
+    while end < ahead.len() && ahead[end].0 < range.1 {
+        range.1 = range.1.max(ahead[end].1);
+        end += 1;
+    }
+    ahead.splice(at..end, [range]);
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -191,8 +235,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if !ahead_covers(&j.ahead, first, last) && ask_kernel(j, first, last) {
+            record_ahead(&mut j.ahead, (first, last));
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -289,9 +333,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    ahead_covers(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -307,7 +349,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if ahead_covers(&j.ahead, first, last) {
         return Some((
             j.ahead_asked,
             j.written
@@ -1054,6 +1096,24 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    #[test]
+    fn ahead_intervals_are_normalized_and_incrementally_indexed() {
+        let mut ahead = vec![(100, 140), (10, 30), (20, 60), (200, 240), (140, 160)];
+        normalize_ahead(&mut ahead);
+        assert_eq!(ahead, [(10, 60), (100, 140), (140, 160), (200, 240)]);
+
+        assert!(ahead_covers(&ahead, 25, 55));
+        assert!(ahead_covers(&ahead, 120, 135));
+        assert!(ahead_covers(&ahead, 140, 160));
+        assert!(!ahead_covers(&ahead, 135, 145), "adjacent intervals do not imply one write-watch reservation");
+        assert!(!ahead_covers(&ahead, 60, 100));
+        assert!(!ahead_covers(&ahead, 0, 10));
+
+        record_ahead(&mut ahead, (130, 210));
+        assert_eq!(ahead, [(10, 60), (100, 240)]);
+        assert!(ahead_covers(&ahead, 135, 205));
     }
 }
 
