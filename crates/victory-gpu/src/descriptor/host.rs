@@ -319,38 +319,97 @@ impl TextureQueue {
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
-    /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+    /// the order to serve them. Previously looked-at slots come first;
+    /// fresh slots alternate newest and oldest writes. The queue can hold
+    /// 25,000-40,000 slots, but a pass takes at most 4,096: select just the
+    /// needed extremes instead of sorting every due entry. Counts are
+    /// collected in the same walk, rather than a second full queue scan.
+    fn due_and_census(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+        let mut census = [self.slots.len() as u64, 0, 0, 0, 0];
+        for (&index, w) in &self.slots {
+            if w.mapped > 0 {
+                census[3] += 1;
+            } else if w.looks > 0 {
+                census[2] += 1;
+            }
+            if w.due > frame {
+                continue;
+            }
+            census[1] += 1;
+            census[4] = census[4].max(frame.saturating_sub(w.written));
+            if max == 0 {
+                continue;
+            }
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((w.written, index, w.write));
         }
+
+        if max == 0 {
+            return (Vec::new(), census);
+        }
+
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut order: Vec<(u32, u64)> = again.into_iter().map(|(_, index, write)| (index, write)).collect();
+
+        let remaining = max.saturating_sub(order.len());
+        if remaining == 0 {
+            return (order, census);
+        }
+
+        if fresh.len() <= remaining {
+            fresh.sort_unstable_by(newest_first);
+            let (mut new, mut old) = (0, fresh.len());
+            while new < old {
+                order.push((fresh[new].1, fresh[new].2));
+                new += 1;
+                if new < old {
+                    old -= 1;
+                    order.push((fresh[old].1, fresh[old].2));
+                }
+            }
+            return (order, census);
+        }
+
+        // Only the newest ceil(remaining/2) and oldest floor(remaining/2)
+        // fresh writes are needed. Partition twice, then sort only those
+        // small slices to preserve the exact newest/oldest turn order.
+        let high_count = remaining.div_ceil(2);
+        let low_count = remaining / 2;
+        fresh.select_nth_unstable_by(high_count, newest_first);
+        let tail_split = {
+            let tail = &mut fresh[high_count..];
+            let split = tail.len() - low_count;
+            if low_count > 0 {
+                tail.select_nth_unstable_by(split, newest_first);
+            }
+            split
+        };
+        let low_start = high_count + tail_split;
+        fresh[..high_count].sort_unstable_by(newest_first);
+        fresh[low_start..].sort_unstable_by(newest_first);
+
+        for turn in 0..remaining {
+            if turn % 2 == 0 {
+                let (index, write) = (fresh[turn / 2].1, fresh[turn / 2].2);
+                order.push((index, write));
+            } else {
+                let at = fresh.len() - 1 - turn / 2;
+                order.push((fresh[at].1, fresh[at].2));
             }
         }
-        order.truncate(max);
-        order
+        (order, census)
+    }
+
+    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_and_census(frame, max).0
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -403,19 +462,7 @@ impl TextureQueue {
     /// waiting for their memory (looked at, never uploaded); uploaded in
     /// part; and the frames the oldest due one has waited since its write.
     fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
-        for w in self.slots.values() {
-            if w.mapped > 0 {
-                c[3] += 1;
-            } else if w.looks > 0 {
-                c[2] += 1;
-            }
-            if w.due <= frame {
-                c[1] += 1;
-                c[4] = c[4].max(frame.saturating_sub(w.written));
-            }
-        }
-        c
+        self.due_and_census(frame, 0).1
     }
 }
 
@@ -791,7 +838,7 @@ impl HostHeap {
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        textures.due_and_census(frame, max)
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -2348,6 +2395,56 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// Taking a bounded batch preserves the original priority order while
+    /// avoiding a full sort of a large due queue.
+    #[test]
+    fn the_texture_queue_partitions_only_the_requested_batch() {
+        let mut q = TextureQueue::default();
+        for index in 0..600u32 {
+            q.written(index, u64::from(index), 0, false);
+            if index < 80 {
+                let write = q.slots[&index].write;
+                q.later(index, write, 0, 2);
+            }
+        }
+
+        let mut again: Vec<_> = q
+            .slots
+            .iter()
+            .filter(|(_, w)| w.due <= 2 && (w.looks > 0 || w.mapped > 0))
+            .map(|(&index, w)| (w.written, index, w.write))
+            .collect();
+        let mut fresh: Vec<_> = q
+            .slots
+            .iter()
+            .filter(|(_, w)| w.due <= 2 && w.looks == 0 && w.mapped == 0)
+            .map(|(&index, w)| (w.written, index, w.write))
+            .collect();
+        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        again.sort_unstable_by(newest_first);
+        fresh.sort_unstable_by(newest_first);
+        let mut expected: Vec<_> = again
+            .iter()
+            .take(128)
+            .map(|&(_, index, write)| (index, write))
+            .collect();
+        let (mut new, mut old) = (0, fresh.len());
+        while new < old && expected.len() < 128 {
+            expected.push((fresh[new].1, fresh[new].2));
+            new += 1;
+            if new < old && expected.len() < 128 {
+                old -= 1;
+                expected.push((fresh[old].1, fresh[old].2));
+            }
+        }
+        expected.truncate(128);
+
+        let (actual, census) = q.due_and_census(2, 128);
+        assert_eq!(actual, expected);
+        assert_eq!(census, q.census(2));
+        assert_eq!(q.due(2, 0), Vec::<(u32, u64)>::new());
     }
 
     /// A view written over memory that older views describe otherwise

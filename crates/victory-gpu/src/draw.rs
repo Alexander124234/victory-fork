@@ -146,6 +146,100 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// The slot ranges belonging to one host-copy shadow. Ordered endpoints
+/// make the encompassing refresh span cheap to retrieve after slot changes.
+struct HeapSpan {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    starts: std::collections::BTreeSet<(u64, u32)>,
+    ends: std::collections::BTreeSet<(u64, u32)>,
+}
+
+impl HeapSpan {
+    fn new(shadow: std::sync::Arc<crate::shadow::Shadow>) -> Self {
+        Self {
+            shadow,
+            starts: std::collections::BTreeSet::new(),
+            ends: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn bounds(&self) -> Option<(u64, u64)> {
+        Some((self.starts.first()?.0, self.ends.last()?.0))
+    }
+
+    fn insert(&mut self, slot: u32, from: u64, to: u64) {
+        self.starts.insert((from, slot));
+        self.ends.insert((to, slot));
+    }
+
+    fn remove(&mut self, slot: u32, from: u64, to: u64) {
+        self.starts.remove(&(from, slot));
+        self.ends.remove(&(to, slot));
+    }
+}
+
+/// Persistent index for the dynamically indexed buffer-view heap. A slot
+/// write updates only that slot's range and its shadow's endpoints; the
+/// full slot set is still reconciled periodically to catch released views.
+#[derive(Default)]
+struct HeapBufferCache {
+    passes: u64,
+    ranges: std::collections::HashMap<
+        u32,
+        (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+    >,
+    spans: std::collections::HashMap<usize, HeapSpan>,
+}
+
+impl HeapBufferCache {
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.spans.clear();
+    }
+
+    fn remove(&mut self, slot: u32) {
+        let Some((shadow, from, to)) = self.ranges.remove(&slot) else {
+            return;
+        };
+        let key = std::sync::Arc::as_ptr(&shadow) as usize;
+        let empty = if let Some(span) = self.spans.get_mut(&key) {
+            span.remove(slot, from, to);
+            span.starts.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            self.spans.remove(&key);
+        }
+    }
+
+    fn insert(
+        &mut self,
+        slot: u32,
+        shadow: std::sync::Arc<crate::shadow::Shadow>,
+        from: u64,
+        to: u64,
+    ) {
+        self.remove(slot);
+        let key = std::sync::Arc::as_ptr(&shadow) as usize;
+        self.spans
+            .entry(key)
+            .or_insert_with(|| HeapSpan::new(shadow.clone()))
+            .insert(slot, from, to);
+        self.ranges.insert(slot, (shadow, from, to));
+    }
+
+    fn spans(&self) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+        self.spans
+            .values()
+            .filter_map(|span| {
+                let (from, to) = span.bounds()?;
+                Some((span.shadow.clone(), from, to))
+            })
+            .collect()
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -1297,33 +1391,33 @@ impl State {
         }
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
+        // reads, kept from pass to pass. Only changed slots are updated.
+        // The encompassing span for each host copy is indexed by ordered
+        // endpoints, so we no longer walk all 81,000 cached views every
+        // frame just to rebuild the same ~4,100 copy spans. All slots are
+        // still reconciled every 16 passes to catch released resources.
+        static RANGES: std::sync::Mutex<
+            Option<std::collections::HashMap<usize, HeapBufferCache>>,
+        > = std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let cache = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_default();
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
+        let slots = if cache.passes % 16 == 0 {
+            cache.clear();
             host.buffer_slots()
         } else {
             changed
         };
-        *passes += 1;
+        cache.passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
+            cache.remove(index);
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
@@ -1345,7 +1439,7 @@ impl State {
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
+            // The copy the slot shows (buffer_copy), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
                 continue;
@@ -1354,20 +1448,12 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            cache.insert(index, shadow, address, address + len);
         }
-        let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
-        }
+        let views = cache.ranges.len() as u32;
+        let spans = cache.spans();
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let bytes: u64 = spans.iter().map(|(_, from, to)| *to - *from).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1378,7 +1464,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, from, to) in &spans {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.

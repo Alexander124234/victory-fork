@@ -53,6 +53,9 @@ Rendering:
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
 - Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
+- The bindless buffer-view heap keeps per-copy refresh spans in an incremental slot index, rather than rescanning all 81,000 cached views every frame; a full reconciliation still runs every 16 passes.
+- The bindless texture queue selects only the batch it can process (up to 4,096 slots), instead of sorting every due entry, and collects its frame counters during the same queue walk.
+- Write-watch ranges are indexed by address in a B-tree, replacing repeated linear scans when checking whether a refresh was already queried; kernel-reported pages go straight into the journal without an intermediate allocation.
 - Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
@@ -200,14 +203,22 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight; adds D3D12 breadcrumb markers |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_GPU_TIMING=1` | timestamps noted draws, dispatches, mesh and indirect commands, then reports GPU time grouped by command and shader pipeline. Does not require DRED. Runs each list separately and disables late submission, so use it to identify GPU hot spots, not to measure normal FPS |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+
+For a GPU profile, build the diagnostics executable and set only
+`VICTORY_GPU_TIMING=1` (leave `VICTORY_D3D12_DRED` unset unless debugging a
+device-removal problem). Compare the `the card's time by command` entries
+across several frame-log intervals. The pipeline portion of each entry
+includes the translated shader hashes; the difference between total card
+wait time and the sum of timed commands is work not covered by command
+markers (for example, preludes and the layer's own copy/hash passes).
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
