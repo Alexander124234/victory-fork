@@ -384,22 +384,25 @@ impl TextureQueue {
         let high_count = remaining.div_ceil(2);
         let low_count = remaining / 2;
         fresh.select_nth_unstable_by(high_count, newest_first);
-        let tail = &mut fresh[high_count..];
-        let tail_split = tail.len() - low_count;
-        if low_count > 0 {
-            tail.select_nth_unstable_by(tail_split, newest_first);
-        }
+        let tail_split = {
+            let tail = &mut fresh[high_count..];
+            let split = tail.len() - low_count;
+            if low_count > 0 {
+                tail.select_nth_unstable_by(split, newest_first);
+            }
+            split
+        };
+        let low_start = high_count + tail_split;
         fresh[..high_count].sort_unstable_by(newest_first);
-        tail[tail_split..].sort_unstable_by(newest_first);
+        fresh[low_start..].sort_unstable_by(newest_first);
 
-        let low = &tail[tail_split..];
         for turn in 0..remaining {
             if turn % 2 == 0 {
                 let (index, write) = (fresh[turn / 2].1, fresh[turn / 2].2);
                 order.push((index, write));
             } else {
-                let at = low.len() - 1 - turn / 2;
-                order.push((low[at].1, low[at].2));
+                let at = fresh.len() - 1 - turn / 2;
+                order.push((fresh[at].1, fresh[at].2));
             }
         }
         (order, census)
