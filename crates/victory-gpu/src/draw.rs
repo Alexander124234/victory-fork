@@ -1453,7 +1453,7 @@ impl State {
         let views = cache.ranges.len() as u32;
         let spans = cache.spans();
         drop(kept);
-        let bytes: u64 = spans.iter().map(|(_, from, to)| to - from).sum();
+        let bytes: u64 = spans.iter().map(|(_, from, to)| *to - *from).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
