@@ -37,10 +37,10 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
-    /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
-    /// and the asking that did: `writes` answers for a range inside one
-    /// from the journal, without another kernel call.
-    ahead: Vec<(usize, usize)>,
+    /// Ordered page ranges asked ahead for a submission's refreshes
+    /// ([`ask_ahead`]) and the asking that did: `writes` answers for a
+    /// range inside one from the journal, without another kernel call.
+    ahead: BTreeMap<usize, usize>,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -52,7 +52,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
-    ahead: Vec::new(),
+    ahead: BTreeMap::new(),
     ahead_asked: 0,
     kept: false,
 });
@@ -92,6 +92,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     j.ahead_asked = j.asked;
     j.ahead.clear();
     let mut i = 0;
+    let mut successful = Vec::new();
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
@@ -103,53 +104,52 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(j, &pieces[i..k]);
+        ask_run(j, &pieces[i..k], &mut successful);
         i = k;
     }
-    // Successful asks can overlap when a failed wide ask is split around
-    // reservation boundaries. Keep the journal's coverage index ordered
-    // and non-overlapping so range lookups are logarithmic.
-    normalize_ahead(&mut j.ahead);
+    // Failed wide asks are split around reservation boundaries. Successful
+    // sub-ranges can overlap, so merge those overlaps into an ordered index.
+    j.ahead = normalize_ahead(successful);
 }
 
 /// Sorts successful write-watch intervals and joins overlaps (not merely
 /// adjacent intervals, which may belong to different reservations).
-fn normalize_ahead(ahead: &mut Vec<(usize, usize)>) {
-    ahead.sort_unstable();
-    let mut written = 0;
-    for read in 0..ahead.len() {
-        let (from, to) = ahead[read];
-        if written != 0 && from < ahead[written - 1].1 {
-            ahead[written - 1].1 = ahead[written - 1].1.max(to);
-        } else {
-            ahead[written] = (from, to);
-            written += 1;
-        }
+fn normalize_ahead(mut ranges: Vec<(usize, usize)>) -> BTreeMap<usize, usize> {
+    ranges.sort_unstable();
+    let mut ahead = BTreeMap::new();
+    for range in ranges {
+        record_ahead(&mut ahead, range);
     }
-    ahead.truncate(written);
+    ahead
 }
 
-/// Whether one ordered interval contains the complete page range.
-fn ahead_covers(ahead: &[(usize, usize)], first: usize, last: usize) -> bool {
-    let at = ahead.partition_point(|&(from, _)| from <= first);
-    at != 0 && ahead[at - 1].1 >= last
+/// Whether one indexed interval contains the complete page range.
+fn ahead_covers(ahead: &BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
+    ahead
+        .range(..=first)
+        .next_back()
+        .is_some_and(|(_, &end)| end >= last)
 }
 
-/// Adds a successful interval while preserving the sorted, non-overlapping
-/// index used by ahead_covers.
-fn record_ahead(ahead: &mut Vec<(usize, usize)>, mut range: (usize, usize)) {
-    let mut at = ahead.partition_point(|&(from, _)| from < range.0);
-    if at != 0 && ahead[at - 1].1 > range.0 {
-        at -= 1;
-        range.0 = ahead[at].0.min(range.0);
-        range.1 = ahead[at].1.max(range.1);
+/// Adds a successful interval while preserving the non-overlapping index.
+fn record_ahead(ahead: &mut BTreeMap<usize, usize>, range: (usize, usize)) {
+    let (mut from, mut to) = range;
+    if let Some((&previous_from, &previous_to)) = ahead.range(..=from).next_back()
+        && previous_to > from
+    {
+        from = previous_from;
+        to = to.max(previous_to);
+        ahead.remove(&previous_from);
     }
-    let mut end = at;
-    while end < ahead.len() && ahead[end].0 < range.1 {
-        range.1 = range.1.max(ahead[end].1);
-        end += 1;
+    loop {
+        let next = ahead.range(from..to).next().map(|(&start, &end)| (start, end));
+        let Some((next_from, next_to)) = next.filter(|(start, _)| *start < to) else {
+            break;
+        };
+        to = to.max(next_to);
+        ahead.remove(&next_from);
     }
-    ahead.splice(at..end, [range]);
+    ahead.insert(from, to);
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -270,19 +270,19 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
-fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
+fn ask_run(j: &mut Journal, pieces: &[(usize, usize)], ahead: &mut Vec<(usize, usize)>) {
     if pieces.len() < 2 {
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel(j, first, last) {
-        j.ahead.push((first, last));
+        ahead.push((first, last));
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run(j, a);
-    ask_run(j, b);
+    ask_run(j, a, ahead);
+    ask_run(j, b, ahead);
 }
 
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
@@ -1100,9 +1100,15 @@ mod tests {
 
     #[test]
     fn ahead_intervals_are_normalized_and_incrementally_indexed() {
-        let mut ahead = vec![(100, 140), (10, 30), (20, 60), (200, 240), (140, 160)];
-        normalize_ahead(&mut ahead);
-        assert_eq!(ahead, [(10, 60), (100, 140), (140, 160), (200, 240)]);
+        let mut ahead = normalize_ahead(vec![
+            (100, 140),
+            (10, 30),
+            (20, 60),
+            (200, 240),
+            (140, 160),
+        ]);
+        let entries: Vec<_> = ahead.iter().map(|(&from, &to)| (from, to)).collect();
+        assert_eq!(entries, [(10, 60), (100, 140), (140, 160), (200, 240)]);
 
         assert!(ahead_covers(&ahead, 25, 55));
         assert!(ahead_covers(&ahead, 120, 135));
@@ -1112,7 +1118,8 @@ mod tests {
         assert!(!ahead_covers(&ahead, 0, 10));
 
         record_ahead(&mut ahead, (130, 210));
-        assert_eq!(ahead, [(10, 60), (100, 240)]);
+        let entries: Vec<_> = ahead.iter().map(|(&from, &to)| (from, to)).collect();
+        assert_eq!(entries, [(10, 60), (100, 240)]);
         assert!(ahead_covers(&ahead, 135, 205));
     }
 }
